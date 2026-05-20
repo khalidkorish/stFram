@@ -178,7 +178,7 @@ def ws_worker(
         try:
             async with websockets.connect(
                 ws_url,
-                extra_headers={"ngrok-skip-browser-warning": "true"},
+                additional_headers={"ngrok-skip-browser-warning": "true"},
                 ping_interval=20,
                 ping_timeout=30,
                 max_size=10 * 1024 * 1024,
