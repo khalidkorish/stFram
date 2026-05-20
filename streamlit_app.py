@@ -1,18 +1,20 @@
 """
 Arabic Real-Time STT — Streamlit App
 =====================================
-الـ Client بيفتح المايك في البراوزر عبر JavaScript،
-يبعت الصوت WebSocket لـ faster-whisper-server عبر الـ ngrok URL.
+The browser captures microphone audio via the Web Audio API (JavaScript),
+encodes each chunk as a proper WAV blob, and POSTs it directly to the
+FastAPI relay server via fetch().  The relay adds a WAV header if needed,
+forwards the audio to faster-whisper-server, and returns the transcript.
+
+Architecture:
+  Browser JS  →  POST /v1/audio/transcriptions  →  FastAPI relay
+                                                 →  faster-whisper-server
+                                                 ←  {"text": "..."}
+  Browser JS  →  postMessage("transcript", text)  →  Streamlit (via st.components)
 """
 
-import asyncio
-import json
-import queue
-import threading
 import time
-from typing import Optional
 
-import numpy as np
 import requests
 import streamlit as st
 
@@ -59,7 +61,8 @@ html, body, [class*="css"] {
     margin-bottom: 1rem;
 }
 .status-idle      { background:#1e2533; color:#6b7fa3; border:1px solid #2a3450; }
-.status-recording { background:#1a2e1a; color:#4ade80; border:1px solid #166534; animation: pulse 1.5s infinite; }
+.status-recording { background:#1a2e1a; color:#4ade80; border:1px solid #166534;
+                    animation: pulse 1.5s infinite; }
 .status-error     { background:#2e1a1a; color:#f87171; border:1px solid #7f1d1d; }
 
 @keyframes pulse {
@@ -82,11 +85,9 @@ html, body, [class*="css"] {
 }
 
 .interim { color: #6b9fd4; font-style: italic; }
-
 .server-ok  { color: #4ade80; }
 .server-err { color: #f87171; }
 
-/* Streamlit overrides */
 div[data-testid="stTextInput"] input {
     background: #1a1f2e !important;
     color: #e8f4fd !important;
@@ -108,12 +109,8 @@ div[data-testid="stButton"] button {
 # ─────────────────────────────────────────────
 for key, default in {
     "transcript": "",
-    "interim": "",
-    "is_recording": False,
-    "ws_thread": None,
-    "stop_event": None,
-    "audio_queue": None,
     "server_ok": None,
+    "server_url": "",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -121,356 +118,374 @@ for key, default in {
 # ─────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────
-def normalize_ws_url(url: str) -> str:
-    """Convert https/http ngrok URL to wss/ws."""
+def normalise_base_url(url: str) -> str:
+    """Strip trailing slash and /v1/… suffix — return bare https://host."""
     url = url.strip().rstrip("/")
-    if url.startswith("https://"):
-        url = "wss://" + url[8:]
-    elif url.startswith("http://"):
-        url = "ws://" + url[7:]
+    # Drop any path component the user might have accidentally pasted
+    for suffix in ["/v1/audio/transcriptions", "/v1", "/health"]:
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
     return url
 
 
 def check_server_health(base_url: str) -> bool:
-    """Ping /health on the REST side."""
-    rest = base_url.replace("wss://", "https://").replace("ws://", "http://")
-    rest = rest.split("/v1")[0]
     try:
-        r = requests.get(f"{rest}/health", timeout=5)
+        r = requests.get(f"{base_url}/health", timeout=6)
         return r.status_code == 200
     except Exception:
         return False
 
 
-def build_ws_url(base_url: str) -> str:
-    ws = normalize_ws_url(base_url)
-    if not ws.endswith("/v1/audio/transcriptions"):
-        ws = ws.rstrip("/") + "/v1/audio/transcriptions"
-    return ws
-
-
 # ─────────────────────────────────────────────
-#  REST API worker (runs in background thread)
+#  Audio capture + transcription — pure JS
+#
+#  How it works:
+#   1. getUserMedia → AudioContext (16 kHz, mono)
+#   2. ScriptProcessor accumulates Float32 frames
+#   3. Every INTERVAL_MS milliseconds the processor:
+#        a. Converts Float32 → PCM-16 LE
+#        b. Builds a proper WAV blob in JS (no server-side header needed)
+#        c. POSTs the WAV blob to  <relay_url>/v1/audio/transcriptions
+#        d. On success, calls window.parent.postMessage with the transcript
+#   4. Streamlit's st.components.v1.html() can receive those postMessages
+#      only in the SAME iframe — we work around this by writing results
+#      into a hidden <textarea> that we poll via Streamlit component.
+#
+#  The cleanest cross-frame approach supported by Streamlit is to have the
+#  JS write results into a dedicated Streamlit text_input via a hidden form
+#  — but that requires a page reload.  Instead we embed the entire widget
+#  (buttons + live transcript display) inside the component iframe so no
+#  cross-frame communication is needed at all.
 # ─────────────────────────────────────────────
-def rest_worker(
-    rest_url: str,
-    audio_queue: queue.Queue,
-    stop_event: threading.Event,
-    transcript_queue: queue.Queue,
-    beam_size: int,
-    language: str,
-):
-    """
-    Collects audio chunks from the queue and sends them periodically to
-    faster-whisper-server REST API for transcription.
-    """
-    import io
-    
-    # Ensure URL doesn't end with /
-    rest_url = rest_url.rstrip("/")
-    if not rest_url.endswith("/v1/audio/transcriptions"):
-        rest_url = rest_url + "/v1/audio/transcriptions"
-    
-    transcript_queue.put(("status", "connected"))
-    audio_buffer = io.BytesIO()
-    chunk_count = 0
-    
-    try:
-        while not stop_event.is_set():
-            try:
-                chunk = audio_queue.get(timeout=0.5)
-                if chunk is None:
-                    # Signal to transcribe accumulated audio
-                    if audio_buffer.tell() > 0:
-                        audio_buffer.seek(0)
-                        audio_data = audio_buffer.read()
-                        if len(audio_data) > 0:
-                            # Send to REST API
-                            files = {"file": ("audio.wav", audio_data, "audio/wav")}
-                            data = {
-                                "language": language,
-                                "temperature": 0.0,
-                                "response_format": "json",
-                            }
-                            r = requests.post(rest_url, files=files, data=data, timeout=30)
-                            if r.status_code == 200:
-                                result = r.json()
-                                text = result.get("text", "")
-                                if text.strip():
-                                    transcript_queue.put(("final", text))
-                        audio_buffer = io.BytesIO()
-                    break
-                else:
-                    # Accumulate audio chunk (it's PCM16 as bytes)
-                    audio_buffer.write(chunk)
-                    chunk_count += 1
-                    
-                    # Every 50 chunks (≈ 1-2 seconds), send to server
-                    if chunk_count >= 50:
-                        audio_buffer.seek(0)
-                        audio_data = audio_buffer.read()
-                        if len(audio_data) > 0:
-                            files = {"file": ("audio.wav", audio_data, "audio/wav")}
-                            data = {
-                                "language": language,
-                                "temperature": 0.0,
-                                "response_format": "json",
-                            }
-                            try:
-                                r = requests.post(rest_url, files=files, data=data, timeout=10)
-                                if r.status_code == 200:
-                                    result = r.json()
-                                    text = result.get("text", "")
-                                    if text.strip():
-                                        transcript_queue.put(("final", text))
-                            except Exception as e:
-                                transcript_queue.put(("error", f"API error: {str(e)}"))
-                        audio_buffer = io.BytesIO()
-                        chunk_count = 0
-                        
-            except queue.Empty:
-                continue
-                
-    except Exception as e:
-        transcript_queue.put(("error", str(e)))
+def build_audio_widget(relay_url: str, language: str, beam_size: int) -> str:
+    """Return the full HTML/JS audio-capture widget."""
+    transcription_endpoint = f"{relay_url}/v1/audio/transcriptions"
+    # Send every ~2 s of audio
+    INTERVAL_MS = 2000
 
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ margin:0; background:transparent; font-family:'Cairo',sans-serif; }}
 
-# ─────────────────────────────────────────────
-#  JavaScript — capture mic in browser → send to Streamlit via component
-# ─────────────────────────────────────────────
-AUDIO_CAPTURE_JS = """
-<script>
-// ── Audio capture via MediaRecorder ──────────────────────────────
-let mediaRecorder = null;
-let audioContext  = null;
-let stream        = null;
+  #widget {{
+    padding: 12px 16px;
+    background: #1a1f2e;
+    border: 1px solid #2a3450;
+    border-radius: 12px;
+  }}
 
-async function startRecording() {
-    try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioContext = new AudioContext({ sampleRate: 16000 });
+  .btn-row {{ display:flex; gap:10px; justify-content:center; margin-bottom:12px; }}
 
-        const source   = audioContext.createMediaStreamSource(stream);
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  button {{
+    padding: 9px 26px;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .2s;
+  }}
+  button:disabled {{ opacity:.4; cursor:default; }}
 
-        source.connect(processor);
-        processor.connect(audioContext.destination);
+  #btn-start {{ background:#166534; color:#fff; }}
+  #btn-stop  {{ background:#7f1d1d; color:#fff; }}
 
-        processor.onaudioprocess = (e) => {
-            const f32 = e.inputBuffer.getChannelData(0);
-            // Convert Float32 → PCM16
-            const pcm16 = new Int16Array(f32.length);
-            for (let i = 0; i < f32.length; i++) {
-                let s = Math.max(-1, Math.min(1, f32[i]));
-                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            }
-            // Send to parent Streamlit frame via postMessage
-            window.parent.postMessage({
-                type: 'audio_chunk',
-                data: Array.from(pcm16)
-            }, '*');
-        };
+  #mic-status {{
+    text-align:center;
+    font-size:.85rem;
+    color:#6b7fa3;
+    margin-bottom: 10px;
+  }}
 
-        document.getElementById('mic-status').textContent = '🔴 يسجّل...';
-        document.getElementById('mic-status').style.color = '#4ade80';
-        mediaRecorder = { processor, source };
+  #live-transcript {{
+    background:#0f1117;
+    border:1px solid #2a3450;
+    border-radius:8px;
+    padding:12px;
+    min-height:120px;
+    max-height:300px;
+    overflow-y:auto;
+    font-size:1.05rem;
+    line-height:1.9;
+    color:#e8f4fd;
+    direction:rtl;
+    text-align:right;
+    white-space:pre-wrap;
+    word-break:break-word;
+  }}
 
-    } catch(err) {
-        document.getElementById('mic-status').textContent = '❌ ' + err.message;
-    }
-}
+  #error-msg {{ color:#f87171; font-size:.85rem; text-align:center; margin-top:6px; }}
 
-function stopRecording() {
-    if (mediaRecorder) {
-        mediaRecorder.processor.disconnect();
-        mediaRecorder.source.disconnect();
-        mediaRecorder = null;
-    }
-    if (audioContext)  { audioContext.close(); audioContext = null; }
-    if (stream)        { stream.getTracks().forEach(t => t.stop()); stream = null; }
-    document.getElementById('mic-status').textContent = '⏹ متوقف';
-    document.getElementById('mic-status').style.color = '#6b7fa3';
-    window.parent.postMessage({ type: 'recording_stopped' }, '*');
-}
-</script>
+  .word-count {{ color:#6b7fa3; font-size:.78rem; text-align:left; margin-top:4px; }}
 
-<div style="text-align:center; padding:1rem;">
-  <button onclick="startRecording()"
-    style="background:#166534;color:white;border:none;padding:10px 28px;
-           border-radius:10px;font-size:1rem;cursor:pointer;margin-left:8px;
-           font-family:Cairo,sans-serif;">
-    🎙️ ابدأ التسجيل
-  </button>
-  <button onclick="stopRecording()"
-    style="background:#7f1d1d;color:white;border:none;padding:10px 28px;
-           border-radius:10px;font-size:1rem;cursor:pointer;
-           font-family:Cairo,sans-serif;">
-    ⏹ وقف
-  </button>
-  <p id="mic-status" style="color:#6b7fa3;margin-top:8px;font-family:Cairo,sans-serif;">
-    ⏹ متوقف
-  </p>
+  .interim {{ color:#6b9fd4; font-style:italic; }}
+</style>
+</head>
+<body>
+<div id="widget">
+  <div class="btn-row">
+    <button id="btn-start" onclick="startRecording()">🎙️ ابدأ التسجيل</button>
+    <button id="btn-stop"  onclick="stopRecording()" disabled>⏹ وقف</button>
+  </div>
+  <div id="mic-status">⏹ في الانتظار</div>
+  <div id="live-transcript"><span style="color:#3a4a6a">النص سيظهر هنا أثناء الكلام…</span></div>
+  <div id="error-msg"></div>
+  <div class="word-count" id="word-count"></div>
 </div>
+
+<script>
+// ── Config ───────────────────────────────────────────────────
+const RELAY_URL    = "{transcription_endpoint}";
+const LANGUAGE     = "{language}";
+const BEAM_SIZE    = {beam_size};
+const INTERVAL_MS  = {INTERVAL_MS};
+const SAMPLE_RATE  = 16000;
+const BUFFER_SIZE  = 4096;
+
+// ── State ────────────────────────────────────────────────────
+let audioCtx    = null;
+let processor   = null;
+let sourceNode  = null;
+let stream      = null;
+let pcmBuffer   = [];   // Float32 samples accumulate here
+let intervalId  = null;
+let fullText    = "";
+let isSending   = false;
+
+const statusEl    = document.getElementById("mic-status");
+const transcEl    = document.getElementById("live-transcript");
+const errorEl     = document.getElementById("error-msg");
+const wordCountEl = document.getElementById("word-count");
+const btnStart    = document.getElementById("btn-start");
+const btnStop     = document.getElementById("btn-stop");
+
+// ── WAV builder ──────────────────────────────────────────────
+function float32ToPcm16(f32arr) {{
+    const buf = new ArrayBuffer(f32arr.length * 2);
+    const view = new DataView(buf);
+    for (let i = 0; i < f32arr.length; i++) {{
+        let s = Math.max(-1, Math.min(1, f32arr[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }}
+    return new Uint8Array(buf);
+}}
+
+function buildWav(pcm16Bytes) {{
+    const numSamples   = pcm16Bytes.length / 2;
+    const byteRate     = SAMPLE_RATE * 1 * 2;   // sampleRate * channels * bytesPerSample
+    const blockAlign   = 1 * 2;
+    const dataSize     = pcm16Bytes.length;
+    const headerSize   = 44;
+    const totalSize    = headerSize + dataSize;
+
+    const buf  = new ArrayBuffer(totalSize);
+    const view = new DataView(buf);
+    let o = 0;
+    const w = (s) => {{ for (let c of s) view.setUint8(o++, c.charCodeAt(0)); }};
+
+    w("RIFF");
+    view.setUint32(o, totalSize - 8, true); o += 4;
+    w("WAVE");
+    w("fmt ");
+    view.setUint32(o, 16, true);            o += 4;   // PCM chunk size
+    view.setUint16(o, 1, true);             o += 2;   // PCM format
+    view.setUint16(o, 1, true);             o += 2;   // mono
+    view.setUint32(o, SAMPLE_RATE, true);   o += 4;
+    view.setUint32(o, byteRate, true);      o += 4;
+    view.setUint16(o, blockAlign, true);    o += 2;
+    view.setUint16(o, 16, true);            o += 2;   // bits per sample
+    w("data");
+    view.setUint32(o, dataSize, true);      o += 4;
+
+    new Uint8Array(buf).set(pcm16Bytes, headerSize);
+    return new Blob([buf], {{ type: "audio/wav" }});
+}}
+
+// ── Send a chunk to the relay ────────────────────────────────
+async function sendChunk() {{
+    if (isSending || pcmBuffer.length === 0) return;
+    isSending = true;
+
+    // Drain accumulated samples
+    const samples = new Float32Array(pcmBuffer.splice(0, pcmBuffer.length));
+    const pcm16   = float32ToPcm16(samples);
+    const wavBlob = buildWav(pcm16);
+
+    const fd = new FormData();
+    fd.append("file",      wavBlob, "chunk.wav");
+    fd.append("language",  LANGUAGE);
+    fd.append("beam_size", BEAM_SIZE);
+    fd.append("temperature", "0.0");
+    fd.append("response_format", "json");
+
+    try {{
+        const resp = await fetch(RELAY_URL, {{ method:"POST", body:fd }});
+        if (resp.ok) {{
+            const json = await resp.json();
+            const text = (json.text || "").trim();
+            if (text) {{
+                fullText += (fullText ? "\\n" : "") + text;
+                transcEl.innerHTML = fullText;
+                transcEl.scrollTop = transcEl.scrollHeight;
+                const words = fullText.split(/\\s+/).filter(Boolean).length;
+                wordCountEl.textContent = "عدد الكلمات: " + words;
+            }}
+            errorEl.textContent = "";
+        }} else {{
+            const errBody = await resp.text();
+            errorEl.textContent = "⚠️ " + resp.status + ": " + errBody.substring(0, 120);
+        }}
+    }} catch(e) {{
+        errorEl.textContent = "❌ تعذّر الاتصال بالسيرفر: " + e.message;
+    }} finally {{
+        isSending = false;
+    }}
+}}
+
+// ── Recording control ────────────────────────────────────────
+async function startRecording() {{
+    errorEl.textContent = "";
+    try {{
+        stream   = await navigator.mediaDevices.getUserMedia({{ audio:true }});
+        audioCtx = new AudioContext({{ sampleRate: SAMPLE_RATE }});
+        sourceNode = audioCtx.createMediaStreamSource(stream);
+        processor  = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+        processor.onaudioprocess = (e) => {{
+            const ch = e.inputBuffer.getChannelData(0);
+            for (let i = 0; i < ch.length; i++) pcmBuffer.push(ch[i]);
+        }};
+
+        sourceNode.connect(processor);
+        processor.connect(audioCtx.destination);
+
+        // Fire send every INTERVAL_MS
+        intervalId = setInterval(sendChunk, INTERVAL_MS);
+
+        statusEl.textContent = "🔴 يسجّل…";
+        statusEl.style.color = "#4ade80";
+        btnStart.disabled = true;
+        btnStop.disabled  = false;
+
+    }} catch(err) {{
+        errorEl.textContent = "❌ " + err.message;
+    }}
+}}
+
+async function stopRecording() {{
+    clearInterval(intervalId);
+
+    // Final flush
+    await sendChunk();
+
+    if (processor)  {{ processor.disconnect(); processor = null; }}
+    if (sourceNode) {{ sourceNode.disconnect(); sourceNode = null; }}
+    if (audioCtx)   {{ await audioCtx.close(); audioCtx = null; }}
+    if (stream)     {{ stream.getTracks().forEach(t => t.stop()); stream = null; }}
+    pcmBuffer = [];
+
+    statusEl.textContent = "⏹ متوقف";
+    statusEl.style.color = "#6b7fa3";
+    btnStart.disabled = false;
+    btnStop.disabled  = true;
+}}
+</script>
+</body>
+</html>
 """
 
+
 # ─────────────────────────────────────────────
-#  UI Layout
+#  UI
 # ─────────────────────────────────────────────
 st.markdown("""
 <div class="title-box">
   <h1>🎙️ التفريغ الصوتي العربي الفوري</h1>
-  <p>مدعوم بـ faster-whisper large-v3-turbo</p>
+  <p>مدعوم بـ faster-whisper large-v3-turbo عبر FastAPI</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Sidebar: Settings ──────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ الإعدادات")
 
     server_url = st.text_input(
-        "🌐 ngrok / Server URL",
-        value=st.session_state.get("server_url", ""),
+        "🌐 Relay URL (ngrok / local)",
+        value=st.session_state.server_url,
         placeholder="https://xxxx-xx-xx-xxx-xx.ngrok-free.app",
-        help="الـ URL اللي ظهر لك بعد تشغيل gpu_server_setup.sh",
+        help="الـ URL الذي ظهر بعد تشغيل gpu_server_setup.py",
         key="server_url",
     )
 
     beam_size = st.slider("Beam Size", 1, 10, 3,
-        help="كبّر للدقة، صغّر للسرعة")
+                          help="كبّر للدقة، صغّر للسرعة")
 
     language = st.selectbox("اللغة", ["ar", "en", "auto"], index=0)
 
     st.divider()
 
-    # Health check
-    if st.button("🔍 اختبر الاتصال بالسيرفر"):
+    if st.button("🔍 اختبر الاتصال"):
         if server_url:
-            with st.spinner("جاري الاتصال..."):
-                ok = check_server_health(server_url)
+            base = normalise_base_url(server_url)
+            with st.spinner("جاري الاتصال …"):
+                ok = check_server_health(base)
             st.session_state.server_ok = ok
         else:
-            st.warning("أدخل الـ URL الأول")
+            st.warning("أدخل الـ URL أولاً")
 
     if st.session_state.server_ok is True:
         st.markdown('<p class="server-ok">✅ السيرفر شغال</p>', unsafe_allow_html=True)
     elif st.session_state.server_ok is False:
-        st.markdown('<p class="server-err">❌ مش قادر يوصل للسيرفر</p>', unsafe_allow_html=True)
+        st.markdown('<p class="server-err">❌ تعذّر الاتصال بالسيرفر</p>', unsafe_allow_html=True)
 
     st.divider()
     st.markdown("""
 **خطوات التشغيل:**
-1. شغّل `gpu_server_setup.sh` على جهاز الـ GPU
-2. انسخ الـ ngrok URL وحطه فوق
-3. اضغط "اختبر الاتصال"
-4. اضغط "ابدأ الجلسة" ثم سجّل
+1. شغّل `gpu_server_setup.py` على جهاز الـ GPU
+2. انسخ الـ ngrok URL وضعه في الحقل أعلاه
+3. اضغط **اختبر الاتصال** ← يجب أن يظهر ✅
+4. اضغط **ابدأ التسجيل** في الويدجت
     """)
 
-# ── Main area ──────────────────────────────────────────────
-col_ctrl, col_transcript = st.columns([1, 2])
+# ── Main area ─────────────────────────────────────────────────
+if not server_url:
+    st.info("👈 أدخل الـ Server URL في الإعدادات على اليسار ثم اختبر الاتصال.")
+else:
+    base_url = normalise_base_url(server_url)
+    widget_html = build_audio_widget(base_url, language, beam_size)
 
-with col_ctrl:
-    st.subheader("🎙️ التحكم")
-
-    if not st.session_state.is_recording:
-        if st.button("▶️ ابدأ الجلسة", type="primary"):
-            if not server_url:
-                st.error("أدخل الـ Server URL في الإعدادات")
-            else:
-                # init state
-                st.session_state.is_recording  = True
-                st.session_state.transcript    = ""
-                st.session_state.interim       = ""
-                st.session_state.stop_event    = threading.Event()
-                st.session_state.audio_queue   = queue.Queue()
-                st.session_state.tq            = queue.Queue()  # transcript updates
-
-                rest_url = normalize_ws_url(server_url).replace("wss://", "https://").replace("ws://", "http://")
-                t = threading.Thread(
-                    target=rest_worker,
-                    args=(
-                        rest_url,
-                        st.session_state.audio_queue,
-                        st.session_state.stop_event,
-                        st.session_state.tq,
-                        beam_size,
-                        language,
-                    ),
-                    daemon=True,
-                )
-                t.start()
-                st.session_state.ws_thread = t
-                st.rerun()
-    else:
-        if st.button("⏹ أوقف الجلسة", type="secondary"):
-            st.session_state.stop_event.set()
-            st.session_state.audio_queue.put(None)
-            st.session_state.is_recording = False
-            st.rerun()
-
-    # Status pill
-    if st.session_state.is_recording:
-        st.markdown('<span class="status-pill status-recording">🔴 جلسة نشطة</span>',
-                    unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="status-pill status-idle">⏸ في الانتظار</span>',
-                    unsafe_allow_html=True)
-
-    # Mic capture widget (only shown during active session)
-    if st.session_state.is_recording:
-        st.components.v1.html(AUDIO_CAPTURE_JS, height=140)
-
-        # Poll transcript queue and show updates
-        if "tq" in st.session_state and st.session_state.tq:
-            tq: queue.Queue = st.session_state.tq
-            updated = False
-            while not tq.empty():
-                kind, text = tq.get_nowait()
-                if kind == "final":
-                    st.session_state.transcript += text + "\n"
-                    st.session_state.interim = ""
-                    updated = True
-                elif kind == "interim":
-                    st.session_state.interim = text
-                    updated = True
-                elif kind == "error":
-                    st.error(f"خطأ: {text}")
-                    st.session_state.is_recording = False
-            if updated:
-                st.rerun()
-
-    # Copy / Clear buttons
-    st.divider()
-    if st.button("🗑️ مسح النص"):
-        st.session_state.transcript = ""
-        st.session_state.interim    = ""
-        st.rerun()
-
-with col_transcript:
-    st.subheader("📝 النص المفرَّغ")
-
-    display = st.session_state.transcript
-    if st.session_state.interim:
-        display += f'<span class="interim">{st.session_state.interim}</span>'
-
-    st.markdown(
-        f'<div class="transcript-box">{display if display else "<span style=\'color:#3a4a6a\'>النص سيظهر هنا أثناء الكلام...</span>"}</div>',
-        unsafe_allow_html=True,
+    st.subheader("🎙️ التسجيل والتفريغ الفوري")
+    st.caption(
+        "يعمل التسجيل والتفريغ مباشرةً داخل الويدجت أدناه — لا حاجة لزر إضافي."
     )
 
-    # Word count
-    word_count = len(st.session_state.transcript.split()) if st.session_state.transcript.strip() else 0
-    st.caption(f"عدد الكلمات: {word_count}")
+    # Height ~520px to accommodate the live transcript inside the component
+    st.components.v1.html(widget_html, height=520, scrolling=False)
 
-    # Download
-    if st.session_state.transcript.strip():
+    st.divider()
+
+    # ── Persistent transcript download area ──────────────────
+    st.subheader("📥 حفظ النص")
+    st.caption(
+        "النص يُعرض داخل الويدجت أعلاه مباشرة. "
+        "لتحميله، انسخه يدوياً أو استخدم الزر أدناه بعد انتهاء الجلسة."
+    )
+
+    manual_text = st.text_area(
+        "الصق النص هنا لتحميله:",
+        height=150,
+        placeholder="انسخ النص من الويدجت أعلاه والصقه هنا …",
+    )
+
+    if manual_text.strip():
         st.download_button(
             label="⬇️ تحميل النص",
-            data=st.session_state.transcript,
+            data=manual_text,
             file_name=f"transcript_{int(time.time())}.txt",
             mime="text/plain",
         )
-
-# ── Auto-refresh while recording ──────────────────────────
-if st.session_state.is_recording:
-    time.sleep(0.5)
-    st.rerun()
