@@ -15,7 +15,6 @@ from typing import Optional
 import numpy as np
 import requests
 import streamlit as st
-import websockets
 
 # ─────────────────────────────────────────────
 #  Page config
@@ -151,10 +150,10 @@ def build_ws_url(base_url: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  WebSocket worker (runs in background thread)
+#  REST API worker (runs in background thread)
 # ─────────────────────────────────────────────
-def ws_worker(
-    ws_url: str,
+def rest_worker(
+    rest_url: str,
     audio_queue: queue.Queue,
     stop_event: threading.Event,
     transcript_queue: queue.Queue,
@@ -162,65 +161,78 @@ def ws_worker(
     language: str,
 ):
     """
-    Opens a WebSocket to faster-whisper-server, streams audio chunks,
-    and puts transcript updates into transcript_queue.
+    Collects audio chunks from the queue and sends them periodically to
+    faster-whisper-server REST API for transcription.
     """
-
-    async def run():
-        init_msg = json.dumps({
-            "language": language,
-            "beam_size": beam_size,
-            "temperature": 0.0,
-            "response_format": "text",
-            "vad_filter": True,
-        })
-
-        try:
-            async with websockets.connect(
-                ws_url,
-                additional_headers={"ngrok-skip-browser-warning": "true"},
-                ping_interval=20,
-                ping_timeout=30,
-                max_size=10 * 1024 * 1024,
-            ) as ws:
-                await ws.send(init_msg)
-                transcript_queue.put(("status", "connected"))
-
-                async def sender():
-                    while not stop_event.is_set():
-                        try:
-                            chunk = audio_queue.get(timeout=0.1)
-                            if chunk is None:
-                                break
-                            await ws.send(chunk)
-                        except queue.Empty:
-                            continue
-                        except Exception as e:
-                            transcript_queue.put(("error", str(e)))
-                            break
-
-                async def receiver():
-                    async for msg in ws:
-                        if stop_event.is_set():
-                            break
-                        try:
-                            data = json.loads(msg) if msg.startswith("{") else None
-                            if data:
-                                text = data.get("text", "")
-                                is_final = data.get("is_final", False)
-                                transcript_queue.put(("final" if is_final else "interim", text))
-                            else:
-                                # plain text response_format
-                                transcript_queue.put(("final", msg))
-                        except Exception:
-                            transcript_queue.put(("final", msg))
-
-                await asyncio.gather(sender(), receiver())
-
-        except Exception as e:
-            transcript_queue.put(("error", str(e)))
-
-    asyncio.run(run())
+    import io
+    
+    # Ensure URL doesn't end with /
+    rest_url = rest_url.rstrip("/")
+    if not rest_url.endswith("/v1/audio/transcriptions"):
+        rest_url = rest_url + "/v1/audio/transcriptions"
+    
+    transcript_queue.put(("status", "connected"))
+    audio_buffer = io.BytesIO()
+    chunk_count = 0
+    
+    try:
+        while not stop_event.is_set():
+            try:
+                chunk = audio_queue.get(timeout=0.5)
+                if chunk is None:
+                    # Signal to transcribe accumulated audio
+                    if audio_buffer.tell() > 0:
+                        audio_buffer.seek(0)
+                        audio_data = audio_buffer.read()
+                        if len(audio_data) > 0:
+                            # Send to REST API
+                            files = {"file": ("audio.wav", audio_data, "audio/wav")}
+                            data = {
+                                "language": language,
+                                "temperature": 0.0,
+                                "response_format": "json",
+                            }
+                            r = requests.post(rest_url, files=files, data=data, timeout=30)
+                            if r.status_code == 200:
+                                result = r.json()
+                                text = result.get("text", "")
+                                if text.strip():
+                                    transcript_queue.put(("final", text))
+                        audio_buffer = io.BytesIO()
+                    break
+                else:
+                    # Accumulate audio chunk (it's PCM16 as bytes)
+                    audio_buffer.write(chunk)
+                    chunk_count += 1
+                    
+                    # Every 50 chunks (≈ 1-2 seconds), send to server
+                    if chunk_count >= 50:
+                        audio_buffer.seek(0)
+                        audio_data = audio_buffer.read()
+                        if len(audio_data) > 0:
+                            files = {"file": ("audio.wav", audio_data, "audio/wav")}
+                            data = {
+                                "language": language,
+                                "temperature": 0.0,
+                                "response_format": "json",
+                            }
+                            try:
+                                r = requests.post(rest_url, files=files, data=data, timeout=10)
+                                if r.status_code == 200:
+                                    result = r.json()
+                                    text = result.get("text", "")
+                                    if text.strip():
+                                        transcript_queue.put(("final", text))
+                            except Exception as e:
+                                transcript_queue.put(("error", f"API error: {str(e)}"))
+                        audio_buffer = io.BytesIO()
+                        chunk_count = 0
+                        
+            except queue.Empty:
+                continue
+                
+    except Exception as e:
+        transcript_queue.put(("error", str(e)))
 
 
 # ─────────────────────────────────────────────
@@ -372,11 +384,11 @@ with col_ctrl:
                 st.session_state.audio_queue   = queue.Queue()
                 st.session_state.tq            = queue.Queue()  # transcript updates
 
-                ws_url = build_ws_url(server_url)
+                rest_url = normalize_ws_url(server_url).replace("wss://", "https://").replace("ws://", "http://")
                 t = threading.Thread(
-                    target=ws_worker,
+                    target=rest_worker,
                     args=(
-                        ws_url,
+                        rest_url,
                         st.session_state.audio_queue,
                         st.session_state.stop_event,
                         st.session_state.tq,
