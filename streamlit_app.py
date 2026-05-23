@@ -110,7 +110,7 @@ div[data-testid="stButton"] button {
 for key, default in {
     "transcript": "",
     "server_ok": None,
-    "server_url": "",
+    "server_url": "http://localhost:2110",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -246,6 +246,23 @@ const BEAM_SIZE    = {beam_size};
 const INTERVAL_MS  = {INTERVAL_MS};
 const SAMPLE_RATE  = 16000;
 const BUFFER_SIZE  = 4096;
+const VAD_THRESHOLD = 0.02; // Increased from 0.005 to be more aggressive
+
+// Common Whisper hallucinations in Arabic to filter out
+const HALLUCINATIONS = [
+    "اشتركوا في القناة", 
+    "شكرا للمشاهدة", 
+    "ترجمة نانسي قنقر", 
+    "نانسي قنقر",
+    "Subscribe",
+    "Watching",
+    "شكرا لك",
+    "شكرا",
+    "قناة",
+    "المشاهدة",
+    "سلام عليكم",
+    "أحمد الله وبرك"
+];
 
 // ── State ────────────────────────────────────────────────────
 let audioCtx    = null;
@@ -309,6 +326,22 @@ function buildWav(pcm16Bytes) {{
 // ── Send a chunk to the relay ────────────────────────────────
 async function sendChunk() {{
     if (isSending || pcmBuffer.length === 0) return;
+
+    // ── Simple VAD (Voice Activity Detection) ────────────────
+    let sum = 0;
+    for (let i = 0; i < pcmBuffer.length; i++) sum += pcmBuffer[i] * pcmBuffer[i];
+    const rms = Math.sqrt(sum / pcmBuffer.length);
+    
+    // If volume is below threshold, treat as silence and don't send
+    if (rms < VAD_THRESHOLD) {{
+        pcmBuffer = []; 
+        statusEl.textContent = "💤 سكوت... (صوت منخفض)";
+        statusEl.style.color = "#6b7fa3";
+        return;
+    }}
+
+    statusEl.textContent = "🔴 يسجّل… (جاري المعالجة)";
+    statusEl.style.color = "#4ade80";
     isSending = true;
 
     // Drain accumulated samples
@@ -327,8 +360,17 @@ async function sendChunk() {{
         const resp = await fetch(RELAY_URL, {{ method:"POST", body:fd }});
         if (resp.ok) {{
             const json = await resp.json();
-            const text = (json.text || "").trim();
-            if (text) {{
+            let text = (json.text || "").trim();
+            
+            // ── Hallucination Filter ────────────────────────
+            const cleanText = text.replace(/[.,\/#!$%\^&\*;:{{}}=\-_`~()]/g,"").trim();
+            const isHallucination = HALLUCINATIONS.some(h => cleanText === h || (cleanText.includes(h) && cleanText.length < h.length + 5));
+            
+            // Check for repetition
+            const lastLine = fullText.split("\\n").pop().replace(/[.,\/#!$%\^&\*;:{{}}=\-_`~()]/g,"").trim();
+            const isRepetition = (cleanText === lastLine && cleanText.length > 0);
+
+            if (text && !isHallucination && !isRepetition && text.length > 1) {{
                 fullText += (fullText ? "\\n" : "") + text;
                 transcEl.innerHTML = fullText;
                 transcEl.scrollTop = transcEl.scrollHeight;
